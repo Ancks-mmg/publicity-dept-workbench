@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>工作台自检</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f5f7;color:#1a1f2b;font-size:14px;line-height:1.6;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:18px;margin:0 0 6px;font-weight:600}
+.hint{color:#667085;font-size:13px;margin:0 0 16px}
+.bar{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+button{font-family:inherit;font-size:13px;padding:8px 16px;border-radius:8px;cursor:pointer;
+  border:1px solid #4f46e5;background:#4f46e5;color:#fff}
+button.ghost{background:#fff;color:#4f46e5}
+button:disabled{opacity:.5;cursor:default}
+#out{background:#fff;border:1px solid #e4e7ec;border-radius:10px;padding:12px 14px;min-height:60px}
+.ln{font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12.5px;white-space:pre-wrap;
+  word-break:break-all;padding:2px 0;border-bottom:1px dashed #f0f1f3}
+.ln:last-child{border-bottom:0}
+.ln.ok{color:#067647}
+.ln.bad{color:#b42318}
+.ln.warn{color:#b54708}
+.ln.head{font-family:inherit;font-size:13px;font-weight:600;color:#1a1f2b;margin-top:6px;border-bottom:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>宣传部工作台 · 运行自检</h1>
+  <p class="hint">此页与工作台同源，会沿用你当前的登录状态。点「开始自检」后请等待跑完（约 1–3 分钟），再把结果发给我。</p>
+  <div class="bar">
+    <button id="run">开始自检</button>
+    <button id="copy" class="ghost">复制结果</button>
+  </div>
+  <div id="out"></div>
+</div>
+<script src="vendor/workbuddy-cloud-sdk.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var outEl = document.getElementById('out');
+  var lines = [];
+
+  function emit(text, cls) {
+    var d = document.createElement('div');
+    d.className = 'ln' + (cls ? ' ' + cls : '');
+    d.textContent = text;
+    outEl.appendChild(d);
+    lines.push(text);
+    try { console.log('[自检]', text); } catch (e) {}
+  }
+  function head(t) { emit('── ' + t + ' ──', 'head'); }
+  function ok(t) { emit('  OK   ' + t, 'ok'); }
+  function bad(t) { emit('  FAIL ' + t, 'bad'); }
+  function warn(t) { emit('  WARN ' + t, 'warn'); }
+  function info(t) { emit('  ·    ' + t); }
+  function ms(t) { return Math.round(t) + 'ms'; }
+  function short(v, n) {
+    var s;
+    if (v == null) return String(v);
+    if (typeof v === 'string') s = v;
+    else { try { s = JSON.stringify(v); } catch (e) { s = String(v); } }
+    return s.length > (n || 300) ? s.slice(0, n || 300) + '…' : s;
+  }
+  function withTimeout(p, msLimit, label) {
+    return Promise.race([
+      Promise.resolve(p),
+      new Promise(function (_, rej) {
+        setTimeout(function () { rej(new Error(label + '：超过 ' + msLimit + 'ms 无响应')); }, msLimit);
+      })
+    ]);
+  }
+  function errText(e) {
+    if (!e) return '未知错误';
+    return (e.message || e.error_description || String(e)) + (e.code ? ' (code=' + e.code + ')' : '');
+  }
+
+  var publicConfig = {
+    endpoint: 'https://pub-dept-workbench.app.workbuddy.host',
+    oauthRelayBaseUrl: 'https://www.workbuddy.cn/v2/as/genie-baas/oauth',
+    publishableKey: 'wbpk_M6MnJd5GA7BROkiqYlzfBe_HDyZxXxvS3MLXHI1VzW6zjLnFKA44RmF'
+  };
+
+  var FALLBACK_PATH = 'shared/2109233974827028480/library/mvaw8dttxsl5-管院团委宣传部资料库分类分级目录-8-27更新.docx';
+
+  async function run() {
+    outEl.innerHTML = '';
+    lines = [];
+    info('页面地址：' + location.origin);
+    info('时间：' + new Date().toLocaleString('zh-CN'));
+
+    head('1 云组件与登录态');
+    if (typeof WorkBuddyCloud === 'undefined' || !WorkBuddyCloud.createWorkBuddyCloud) {
+      bad('云 SDK 未加载（vendor/workbuddy-cloud-sdk.js）');
+      return;
+    }
+    ok('云 SDK 已加载');
+    var cloud;
+    try {
+      cloud = WorkBuddyCloud.createWorkBuddyCloud({
+        endpoint: publicConfig.endpoint,
+        oauthRelayBaseUrl: publicConfig.oauthRelayBaseUrl,
+        publishableKey: publicConfig.publishableKey
+      });
+      ok('createWorkBuddyCloud 成功');
+    } catch (e) { bad('初始化失败：' + errText(e)); return; }
+
+    var uid = null;
+    try {
+      var s = await withTimeout(cloud.auth.getSession(), 20000, 'getSession');
+      uid = s && s.data && s.data.user ? (s.data.user.id || s.data.user.uid) : null;
+      if (uid) ok('已登录，uid = ' + uid);
+      else { bad('未取到登录态：' + short(s)); return; }
+    } catch (e) { bad('getSession 失败：' + errText(e)); return; }
+
+    head('2 数据读取（关键：单次 vs 分页）');
+    var all = [];
+    try {
+      var t1 = performance.now();
+      var r1 = await withTimeout(cloud.database.from('library_files').select('*').order('id', { ascending: true }), 60000, '单次查询');
+      var n1 = (r1 && r1.data ? r1.data.length : 0);
+      info('单次 select(\'*\') 返回 ' + n1 + ' 行，耗时 ' + ms(performance.now() - t1) + (r1 && r1.error ? '，错误：' + r1.error.message : ''));
+      if (n1 >= 200) warn('单次返回正好达到/超过 200，疑似服务端有单次行数上限');
+      all = (r1 && r1.data) || [];
+    } catch (e) { bad('单次查询失败：' + errText(e)); }
+
+    try {
+      var t2 = performance.now();
+      var collected = [], from = 0, rounds = 0;
+      while (rounds++ < 20) {
+        var rr = await withTimeout(
+          cloud.database.from('library_files').select('*').order('id', { ascending: true }).range(from, from + 199),
+          60000, '分页查询');
+        if (rr && rr.error) { bad('分页查询出错：' + rr.error.message); break; }
+        var got = (rr && rr.data) || [];
+        collected = collected.concat(got);
+        if (got.length < 200) break;
+        from += 200;
+      }
+      info('分页循环共取到 ' + collected.length + ' 行，' + rounds + ' 轮，耗时 ' + ms(performance.now() - t2) + 'ms');
+      if (collected.length > all.length) {
+        warn('分页比单次多 ' + (collected.length - all.length) + ' 行 → 单次查询确实被截断，这是「文件数卡住」的根因');
+      } else if (collected.length === all.length) {
+        ok('分页与单次结果一致，均为 ' + all.length + ' 行（当前未触发截断）');
+      }
+      if (collected.length) all = collected;
+    } catch (e) { bad('分页查询失败：' + errText(e)); }
+
+    try {
+      var rc = await withTimeout(
+        cloud.database.from('library_files').select('*', { count: 'exact', head: true }), 30000, '精确计数');
+      info('服务端精确计数 count = ' + ((rc && rc.count != null) ? rc.count : '取不到') +
+        (rc && rc.error ? '  错误：' + rc.error.message : ''));
+      if (rc && rc.count != null && rc.count > all.length) {
+        warn('精确计数 ' + rc.count + ' > 本地拿到 ' + all.length + ' → 前端确实少拿了数据');
+      }
+    } catch (e) { bad('精确计数失败：' + errText(e)); }
+
+    var plain = all.filter(function (x) { return x.storage_path; });
+    info('本地拿到 ' + all.length + ' 行，其中含 storage_path 的 ' + plain.length + ' 行');
+
+    head('3 文件访问（预览/下载走的就是这一环）');
+    var target = plain.length ? plain[plain.length - 1] : null;
+    var testPath = target ? target.storage_path : FALLBACK_PATH;
+    info('测试对象路径：' + testPath);
+    if (target) info('文件名：' + target.name + '，大小：' + target.size + ' 字节');
+
+    var signedUrl = null;
+    try {
+      var t3 = performance.now();
+      var su = await withTimeout(cloud.storage.createSignedUrl(testPath, 3600), 30000, 'createSignedUrl');
+      info('createSignedUrl 耗时 ' + ms(performance.now() - t3));
+      if (su && su.error) {
+        bad('createSignedUrl 返回错误：' + short(su.error));
+      } else {
+        var d = (su && su.data) || {};
+        signedUrl = d.signedUrl || d.url || d.signedURL || null;
+        if (signedUrl) ok('拿到签名地址：' + short(signedUrl, 160));
+        else bad('返回里没有 URL 字段：' + short(su, 300));
+      }
+    } catch (e) { bad('createSignedUrl 抛错：' + errText(e)); }
+
+    if (signedUrl) {
+      for (var m = 0; m < 2; m++) {
+        var method = m === 0 ? 'HEAD' : 'GET';
+        try {
+          var t4 = performance.now();
+          var resp = await withTimeout(fetch(signedUrl, { method: method }), 30000, method + ' 请求');
+          info(method + ' 签名地址 → HTTP ' + resp.status + '，' + ms(performance.now() - t4) +
+            '，content-type=' + (resp.headers.get('content-type') || '无') +
+            '，content-length=' + (resp.headers.get('content-length') || '无') +
+            '，frameguard=' + (resp.headers.get('x-frame-options') || resp.headers.get('content-security-policy') || '无'));
+          if (resp.status >= 400) bad(method + ' 被拒（' + resp.status + '）');
+          else ok(method + ' 通过');
+        } catch (e) { bad(method + ' 请求异常：' + errText(e)); }
+      }
+    }
+
+    if (typeof cloud.storage.getPublicUrl === 'function') {
+      try {
+        var pu = cloud.storage.getPublicUrl(testPath);
+        var purl = pu && pu.data && pu.data.publicUrl;
+        if (purl) {
+          var resp2 = await withTimeout(fetch(purl, { method: 'HEAD' }), 30000, 'publicUrl 请求');
+          info('公开地址 → HTTP ' + resp2.status + '，' + short(purl, 120));
+          if (resp2.status < 400) ok('公开地址可用（可作为备选方案）');
+          else warn('公开地址返回 ' + resp2.status + '（未登录或不公开）');
+        } else { warn('getPublicUrl 无返回：' + short(pu, 200)); }
+      } catch (e) { warn('getPublicUrl 测试异常：' + errText(e)); }
+    } else {
+      info('SDK 上未暴露 getPublicUrl，跳过');
+    }
+
+    try {
+      var t5 = performance.now();
+      var dl = await withTimeout(cloud.storage.download(testPath), 30000, 'download');
+      var b = dl && dl.data;
+      if (b && typeof b.blob === 'function') b = await b.blob();
+      var sz = (b && b.size != null) ? b.size : (b && b.length != null ? b.length : null);
+      if (dl && dl.error) bad('download 返回错误：' + short(dl.error));
+      else ok('download 成功，字节数 = ' + sz + '，耗时 ' + ms(performance.now() - t5));
+    } catch (e) { bad('download 失败：' + errText(e)); }
+
+    head('4 AI 一键导入（大模型调用）');
+    try {
+      var t6 = performance.now();
+      var r6 = await withTimeout(cloud.llm.chat.completions.create({
+        model: 'auto',
+        messages: [
+          { role: 'system', content: '你是格式助手，只输出 JSON。' },
+          { role: 'user', content: '输出 {"tasks":[]} 这个 JSON，不要任何多余文字。' }
+        ]
+      }), 90000, 'LLM 非流式调用');
+      var took = performance.now() - t6;
+      if (r6 && r6.error) {
+        bad('LLM 返回错误：' + short(r6.error, 400));
+      } else {
+        var txt = r6 && r6.choices && r6.choices[0] && r6.choices[0].message
+          ? (r6.choices[0].message.content || '') : '';
+        ok('LLM 非流式返回，耗时 ' + ms(took) + '，内容长度 ' + (txt ? txt.length : 0));
+        info('内容片段：' + short(txt, 160));
+        if (!txt) warn('content 为空；该模型是推理模型，可能只给了 reasoning 字段 → 这会导致前端一直等不到内容');
+        if (r6 && r6.choices && r6.choices[0] && r6.choices[0].message) {
+          info('message 字段：' + Object.keys(r6.choices[0].message).join(', '));
+        }
+      }
+    } catch (e) { bad('LLM 非流式失败：' + errText(e)); }
+
+    try {
+      var t7 = performance.now();
+      var firstAt = null, chars = 0, chunks = 0, reasoningChars = 0;
+      var stream = await withTimeout(cloud.llm.chat.completions.create({
+        model: 'auto',
+        messages: [{ role: 'user', content: '只回复两个字：收到' }],
+        stream: true
+      }), 90000, 'LLM 流式建立');
+      for await (var ch of stream) {
+        chunks++;
+        if (firstAt === null) firstAt = performance.now() - t7;
+        var dl2 = ch && ch.choices && ch.choices[0] && ch.choices[0].delta;
+        if (dl2 && dl2.content) chars += dl2.content.length;
+        if (dl2 && dl2.reasoning_content) reasoningChars += dl2.reasoning_content.length;
+      }
+      ok('流式完成：首包 ' + (firstAt === null ? '未收到' : ms(firstAt)) +
+        '，共 ' + chunks + ' 个 chunk，正文 ' + chars + ' 字符，reasoning ' + reasoningChars + ' 字符，总耗时 ' + ms(performance.now() - t7));
+      if (chars === 0 && reasoningChars > 0) {
+        warn('只收到 reasoning、没有正文 → 前端只读 delta.content，会一直等不到内容，这就是「一直转圈」的原因');
+      }
+    } catch (e) { bad('LLM 流式失败：' + errText(e)); }
+
+    head('自检结束');
+    info('请把以上全部内容复制发回给助手。');
+  }
+
+  document.getElementById('run').addEventListener('click', async function () {
+    var btn = this;
+    btn.disabled = true; btn.textContent = '自检中…';
+    try { await run(); }
+    catch (e) { bad('自检意外中断：' + errText(e)); }
+    btn.disabled = false; btn.textContent = '重新自检';
+  });
+
+  document.getElementById('copy').addEventListener('click', async function () {
+    var text = lines.join('\n');
+    try { await navigator.clipboard.writeText(text); this.textContent = '已复制'; }
+    catch (e) { this.textContent = '复制失败，请手动选择'; }
+    var b = this;
+    setTimeout(function () { b.textContent = '复制结果'; }, 2000);
+  });
+})();
+</script>
+</body>
+</html>
